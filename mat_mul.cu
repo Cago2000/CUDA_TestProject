@@ -34,7 +34,7 @@ void matrixMultiply(float* A, float* B, float* C, int N) {
 }
 
 int main(void) {
-    int N = 1 << 20;
+    int N = 1 << 13;
     size_t size = N * N * sizeof(float);
 
     float* A, * B, * C;
@@ -48,14 +48,14 @@ int main(void) {
     }
 
 
-    dim3 blockSize(sqrt(N), sqrt(N));
+    dim3 blockSize(32, 32);
     dim3 gridSize((N + blockSize.x - 1) / blockSize.x, (N + blockSize.y - 1) / blockSize.y);
-    std::cout << blockSize.x << std::endl;
-    std::cout << blockSize.y << std::endl;
-    std::cout << blockSize.z << std::endl;
-    std::cout << gridSize.x << std::endl;
-    std::cout << gridSize.y << std::endl;
-    std::cout << gridSize.z << std::endl;
+    std::cout << "Blocksize X: " << blockSize.x << std::endl;
+    std::cout << "Blocksize Y: " << blockSize.y << std::endl;
+    std::cout << "Blocksize Z: " << blockSize.z << std::endl;
+    std::cout << "Gridsize X: " << gridSize.x << std::endl;
+    std::cout << "Gridsize Y: " << gridSize.y << std::endl;
+    std::cout << "Gridsize Z: " << gridSize.z << std::endl;
 
     matrixMultiply <<<gridSize, blockSize >>> (A, B, C, N);
 
