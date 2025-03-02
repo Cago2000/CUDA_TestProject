@@ -1,8 +1,10 @@
 #include <iostream>
 #include <cmath>
+#include <vector>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
+#define TILE_SIZE 32  // Tile size for shared memory
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -11,18 +13,33 @@
     } \
 } while (0)
 
+struct Kernel {
+    float* A, * B, * C;
+    std::string name;
+    void (*kernel)(float*, float*, float*, int);
+    int N;
+    float expected_value;
+};
+
+struct KernelInfo {
+    std::string name;
+    void (*kernel)(float*, float*, float*, int);
+    int N;
+    float expected_value;
+};
+
+
 __global__
-void matrixAdd(float* A, float* B, float* C, int N, int* jobs_done) {
+void matrixAdd(float* A, float* B, float* C, int N) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < N && col < N) {
         C[row * N + col] = A[row * N + col] + B[row * N + col];
-        atomicAdd(jobs_done, 1);
     }
 }
 
 __global__
-void matrixMultiply(float* A, float* B, float* C, int N, int* jobs_done) {
+void matrixMultiply(float* A, float* B, float* C, int N) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < N && col < N) {
@@ -31,38 +48,53 @@ void matrixMultiply(float* A, float* B, float* C, int N, int* jobs_done) {
             value += A[row * N + k] * B[k * N + col];
         }
         C[row * N + col] = value;
-        atomicAdd(jobs_done, 1);
     }
 }
 
-void allocateMatrixMemory(float** A, float** B, float** C, int N) {
+__global__
+void matrixMultiplyOptimized(float* A, float* B, float* C, int N) {
+    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
+    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float value = 0.0f;
+
+    for (int i = 0; i < (N + TILE_SIZE - 1) / TILE_SIZE; i++) {
+        if (row < N && i * TILE_SIZE + threadIdx.x < N)
+            tileA[threadIdx.y][threadIdx.x] = A[row * N + i * TILE_SIZE + threadIdx.x];
+        else
+            tileA[threadIdx.y][threadIdx.x] = 0.0f;
+
+        if (col < N && i * TILE_SIZE + threadIdx.y < N)
+            tileB[threadIdx.y][threadIdx.x] = B[(i * TILE_SIZE + threadIdx.y) * N + col];
+        else
+            tileB[threadIdx.y][threadIdx.x] = 0.0f;
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE_SIZE; k++) {
+            value += tileA[threadIdx.y][k] * tileB[k][threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (row < N && col < N) {
+        C[row * N + col] = value;
+    }
+}
+
+void allocateAndInitializeMatrix(float** A, float** B, float** C, int N) {
     size_t size = N * N * sizeof(float);
     CUDA_CHECK(cudaMallocManaged(A, size));
     CUDA_CHECK(cudaMallocManaged(B, size));
     CUDA_CHECK(cudaMallocManaged(C, size));
-}
 
-void allocateJobsDone(int** jobs_done) {
-    cudaMallocManaged(jobs_done, sizeof(int));
-    cudaMemset(*jobs_done, 0, sizeof(int));
-}
-
-
-void initializeMatrix(float* A, float* B, int N) {
     for (int i = 0; i < N * N; i++) {
-        A[i] = 1.0f;
-        B[i] = 2.0f;
+        (*A)[i] = 1.0f;
+        (*B)[i] = 2.0f;
     }
-}
-
-void launchMatrixAddKernel(float* A, float* B, float* C, int N, int* jobs_done, dim3 blockSize, dim3 gridSize, cudaStream_t stream) {
-    matrixAdd << <gridSize, blockSize, 0, stream >>> (A, B, C, N, jobs_done);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-void launchMatrixMultiplyKernel(float* A, float* B, float* C, int N, int* jobs_done, dim3 blockSize, dim3 gridSize, cudaStream_t stream) {
-    matrixMultiply << <gridSize, blockSize, 0, stream >> > (A, B, C, N, jobs_done);
-    CUDA_CHECK(cudaGetLastError());
 }
 
 float calculateMaxError(float* C, int N, float expected_value) {
@@ -73,52 +105,67 @@ float calculateMaxError(float* C, int N, float expected_value) {
     return maxError;
 }
 
+void executeKernel(const Kernel& data) {
+    dim3 blockSize(TILE_SIZE, TILE_SIZE);
+    dim3 gridSize((data.N + blockSize.x - 1) / blockSize.x, (data.N + blockSize.y - 1) / blockSize.y);
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+
+    // CUDA events for timing
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    // Record start time
+    CUDA_CHECK(cudaEventRecord(start, stream));
+
+    // Launch kernel
+    data.kernel << <gridSize, blockSize, 0, stream >> > (data.A, data.B, data.C, data.N);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Record stop time
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    // Compute elapsed time
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+
+    // Destroy events
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+    // Output time for each kernel
+    std::cout << data.name << " | Execution Time: " << milliseconds << " ms | Max Error: "
+        << calculateMaxError(data.C, data.N, data.expected_value) << std::endl;
+}
+
+__global__ void warmupKernel() {}
+
 int main(void) {
-    int N_mat_mul = 1 << 8;
-    int N_mat_add = 1 << 13;
+    cudaFree(0);
+    warmupKernel << <1, 1 >> > ();
+    cudaDeviceSynchronize();
 
-    float* A_mat_mul, * B_mat_mul, * A_mat_add, * B_mat_add;
-    float* C_mat_mul, * C_mat_add;
-    allocateMatrixMemory(&A_mat_mul, &B_mat_mul, &C_mat_mul, N_mat_mul);
-    allocateMatrixMemory(&A_mat_add, &B_mat_add, &C_mat_add, N_mat_add);
+    std::vector<KernelInfo> kernel_config_vec = {
+        {"Matrix Multiplication Optimized #1", matrixMultiplyOptimized, 1 << 11, ((int) 1 << 11) * 2.0f},
+        {"Matrix Multiplication Optimized #2", matrixMultiplyOptimized, 1 << 11, ((int) 1 << 11) * 2.0f},
+        {"Matrix Multiplication Optimized #3", matrixMultiplyOptimized, 1 << 11, ((int) 1 << 11) * 2.0f},
+        {"Matrix Multiplication #1", matrixMultiply, 1 << 11, ((int) 1 << 11) * 2.0f},
+        {"Matrix Add #1", matrixAdd, 1 << 11, 3.0f},
 
-    int* jobs_done_mat_mul;
-    int* jobs_done_mat_add;
-    allocateJobsDone(&jobs_done_mat_mul);
-    allocateJobsDone(&jobs_done_mat_add);
+    };
 
-    initializeMatrix(A_mat_mul, B_mat_mul, N_mat_mul);
-    initializeMatrix(A_mat_add, B_mat_add, N_mat_add);
+    for (const auto& kernel : kernel_config_vec) {
+        float* A, * B, * C;
+        allocateAndInitializeMatrix(&A, &B, &C, kernel.N);
+        executeKernel({ A, B, C, kernel.name, kernel.kernel, kernel.N, kernel.expected_value});
 
-    dim3 blockSize(32, 32);
-    dim3 gridSize_mat_mul((N_mat_mul + blockSize.x - 1) / blockSize.x, (N_mat_mul + blockSize.y - 1) / blockSize.y);
-    dim3 gridSize_mat_add((N_mat_add + blockSize.x - 1) / blockSize.x, (N_mat_add + blockSize.y - 1) / blockSize.y);
+        cudaFree(A);
+        cudaFree(B);
+        cudaFree(C);
+    }
 
-    cudaStream_t stream_mat_mul, stream_mat_add;
-    CUDA_CHECK(cudaStreamCreate(&stream_mat_mul));
-    CUDA_CHECK(cudaStreamCreate(&stream_mat_add));
-
-    launchMatrixMultiplyKernel(A_mat_mul, B_mat_mul, C_mat_mul, N_mat_mul, jobs_done_mat_mul ,blockSize, gridSize_mat_mul, stream_mat_mul);
-    launchMatrixAddKernel(A_mat_add, B_mat_add, C_mat_add, N_mat_add, jobs_done_mat_add, blockSize, gridSize_mat_add, stream_mat_add);
-
-    cudaStreamSynchronize(stream_mat_mul);
-    cudaStreamSynchronize(stream_mat_add);
-
-    float maxError_mat_mul = calculateMaxError(C_mat_mul, N_mat_mul, 2.0f * N_mat_mul);
-    float maxError_mat_add = calculateMaxError(C_mat_add, N_mat_add, 3.0f);
-
-    std::cout << "Matrix Multiply, Jobs done: " << *jobs_done_mat_mul << " out of " << N_mat_mul * N_mat_mul << ", Max Error: " << maxError_mat_mul << std::endl;
-    std::cout << "Matrix Add, Jobs done: " << *jobs_done_mat_add << " out of " << N_mat_add * N_mat_add << ", Max Error: " << maxError_mat_add << std::endl;
-
-    cudaStreamDestroy(stream_mat_mul);
-    cudaStreamDestroy(stream_mat_add);
-    cudaFree(A_mat_mul);
-    cudaFree(B_mat_mul);
-    cudaFree(A_mat_add);
-    cudaFree(B_mat_add);
-    cudaFree(C_mat_mul);
-    cudaFree(C_mat_add);
-    cudaFree(jobs_done_mat_mul);
-    cudaFree(jobs_done_mat_add);
     return 0;
 }
