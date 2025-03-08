@@ -83,7 +83,14 @@
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <CudaCompile Include="fibonacci.cu" />
+    <CudaCompile Include="main.cu" />
     <CudaCompile Include="mat_mul.cu" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="definitions.cuh" />
+    <ClInclude Include="fibonacci.cuh" />
+    <ClInclude Include="mat_mul.cuh" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
