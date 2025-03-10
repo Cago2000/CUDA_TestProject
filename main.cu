@@ -4,7 +4,6 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "mat_mul.cuh"
-#include "fibonacci.cuh"
 
 int main(void) {
     cudaFree(0);
@@ -22,16 +21,11 @@ int main(void) {
     for (const auto& kernel : kernel_config_vec) {
         float* A, * B, * C;
         allocateAndInitializeMatrix(&A, &B, &C, kernel.N);
-        executeMatMulKernel({ A, B, C, kernel.name, kernel.kernel, kernel.N, kernel.expected_value });
+        executeMatMulKernel({ A, B, C, kernel.name, kernel.kernel, kernel.N, kernel.expected_value});
 
         cudaFree(A);
         cudaFree(B);
         cudaFree(C);
     }
-
-    int n = 1000;
-    std::string name = "Multiple Fibonacci 1000";
-    executeFibonacciKernel(name, n);
-   
     return 0;
 }
